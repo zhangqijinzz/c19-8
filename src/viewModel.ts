@@ -22,10 +22,15 @@ const toRenderElements = (document: LayoutDocument): RenderElement[] => document
 const starter = createStarterDocument();
 const starterRenderElements = toRenderElements(starter);
 
+const DRAG_SAVE_DEBOUNCE_MS = 400;
+
 type Listener = () => void;
 
 export class ExpoSketchViewModel {
   private listeners = new Set<Listener>();
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  private saveInFlight = false;
+  private savePending = false;
   private stateValue: ExpoSketchState = {
     phase: 'loading',
     document: starter,
@@ -75,7 +80,13 @@ export class ExpoSketchViewModel {
 
   moveElement(id: string, x: number, y: number) {
     const elements = this.stateValue.document.elements.map((element) => element.id === id ? { ...element, x: Number(x.toFixed(1)), y: Number(y.toFixed(1)) } : element);
-    this.commitAndPersist({ document: { ...this.stateValue.document, elements } });
+    this.commit({ document: { ...this.stateValue.document, elements } });
+    this.schedulePersist();
+  }
+
+  endDrag() {
+    if (!this.persistTimer && !this.savePending) return;
+    this.requestPersist();
   }
 
   resizeSelected(width: number, height: number) {
@@ -116,15 +127,48 @@ export class ExpoSketchViewModel {
 
   private commitAndPersist(patch: Partial<ExpoSketchState>) {
     this.commit(patch);
-    void this.persist();
+    this.requestPersist();
   }
 
-  private async persist() {
+  private schedulePersist() {
+    this.cancelScheduledPersist();
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      this.requestPersist();
+    }, DRAG_SAVE_DEBOUNCE_MS);
+  }
+
+  private cancelScheduledPersist() {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+  }
+
+  private requestPersist() {
+    this.cancelScheduledPersist();
+    this.savePending = true;
+    if (this.saveInFlight) return;
+    this.saveInFlight = true;
+    void this.drainPersistQueue();
+  }
+
+  private async drainPersistQueue() {
     try {
-      await this.repository.save(this.stateValue.document);
-      this.commit({ lastSavedAt: Date.now() });
-    } catch {
-      this.commit({ notice: { tone: 'error', message: '本地保存失败，当前编辑仍保留在页面中' } });
+      while (this.savePending) {
+        this.savePending = false;
+        const snapshot = this.stateValue.document;
+        try {
+          await this.repository.save(snapshot);
+          if (!this.savePending) this.commit({ lastSavedAt: Date.now() });
+        } catch {
+          this.savePending = true;
+          this.commit({ notice: { tone: 'error', message: '本地保存失败，当前编辑仍保留在页面中' } });
+          break;
+        }
+      }
+    } finally {
+      this.saveInFlight = false;
     }
   }
 
