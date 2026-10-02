@@ -24,8 +24,21 @@ const starterRenderElements = toRenderElements(starter);
 
 type Listener = () => void;
 
+export const DEFAULT_SAVE_DELAY_MS = 400;
+export const SAVE_RETRY_DELAY_MS = 2000;
+
+export interface ExpoSketchViewModelOptions {
+  saveDelayMs?: number;
+  saveRetryDelayMs?: number;
+}
+
 export class ExpoSketchViewModel {
   private listeners = new Set<Listener>();
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private hasUnsavedChanges = false;
+  private isFlushing = false;
+  private readonly saveDelayMs: number;
+  private readonly saveRetryDelayMs: number;
   private stateValue: ExpoSketchState = {
     phase: 'loading',
     document: starter,
@@ -38,7 +51,10 @@ export class ExpoSketchViewModel {
     lastSavedAt: null,
   };
 
-  constructor(private readonly repository: LayoutRepository) {}
+  constructor(private readonly repository: LayoutRepository, options: ExpoSketchViewModelOptions = {}) {
+    this.saveDelayMs = options.saveDelayMs ?? DEFAULT_SAVE_DELAY_MS;
+    this.saveRetryDelayMs = options.saveRetryDelayMs ?? SAVE_RETRY_DELAY_MS;
+  }
 
   get state() { return this.stateValue; }
 
@@ -116,15 +132,44 @@ export class ExpoSketchViewModel {
 
   private commitAndPersist(patch: Partial<ExpoSketchState>) {
     this.commit(patch);
-    void this.persist();
+    this.schedulePersist(this.saveDelayMs);
   }
 
-  private async persist() {
+  // 防抖调度：连续改动（如拖动）只在停顿后落库，而不是每一下都写
+  private schedulePersist(delayMs: number) {
+    this.hasUnsavedChanges = true;
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      void this.flushPersist();
+    }, delayMs);
+  }
+
+  // 串行落库：同一时刻最多一笔写在途；写在途期间产生的新改动会在写完后立刻补写，
+  // 因此最终落库的永远是最新状态，不会出现先写的慢写盖掉后写的。
+  private async flushPersist() {
+    if (this.isFlushing) return;
+    this.isFlushing = true;
     try {
-      await this.repository.save(this.stateValue.document);
-      this.commit({ lastSavedAt: Date.now() });
-    } catch {
-      this.commit({ notice: { tone: 'error', message: '本地保存失败，当前编辑仍保留在页面中' } });
+      while (this.hasUnsavedChanges) {
+        this.hasUnsavedChanges = false;
+        const document = this.stateValue.document;
+        try {
+          await this.repository.save(document);
+          // 只有刚落库的内容仍是当前最新状态时，才刷新状态栏的保存时间
+          if (!this.hasUnsavedChanges && document === this.stateValue.document) {
+            this.commit({ lastSavedAt: Date.now() });
+          }
+        } catch {
+          // 保留待写标记并延迟重试，改动不会因为一次失败而丢
+          this.hasUnsavedChanges = true;
+          this.commit({ notice: { tone: 'error', message: '本地保存失败，当前编辑仍保留在页面中' } });
+          this.schedulePersist(this.saveRetryDelayMs);
+          break;
+        }
+      }
+    } finally {
+      this.isFlushing = false;
     }
   }
 
